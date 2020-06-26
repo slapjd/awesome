@@ -1688,6 +1688,7 @@ client_geometry_refresh(void)
     foreach(_c, globalconf.clients)
     {
         client_t *c = *_c;
+        bool should_be_reparented = !c->fullscreen;
 
         /* Compute the client window's and frame window's geometry */
         area_t geometry = c->geometry;
@@ -1726,6 +1727,66 @@ client_geometry_refresh(void)
             real_geometry.y = 0;
         }
 
+        if ((c->frame_window != XCB_NONE) != should_be_reparented) {
+            uint32_t no_event[] = { 0 };
+            xcb_grab_server(globalconf.connection);
+
+            xcb_change_window_attributes(globalconf.connection,
+                                         globalconf.screen->root,
+                                         XCB_CW_EVENT_MASK,
+                                         no_event);
+            xcb_change_window_attributes(globalconf.connection,
+                                         c->window,
+                                         XCB_CW_EVENT_MASK,
+                                         no_event);
+            if (should_be_reparented) {
+                assert(c->frame_window == XCB_NONE);
+
+                c->frame_window = xcb_generate_id(globalconf.connection);
+                xcb_create_window(globalconf.connection, globalconf.default_depth, c->frame_window, globalconf.screen->root,
+                                  real_geometry.x, real_geometry.y, real_geometry.width, real_geometry.height,
+                                  c->border_width, XCB_COPY_FROM_PARENT, globalconf.visual->visual_id,
+                                  XCB_CW_BORDER_PIXEL | XCB_CW_BIT_GRAVITY | XCB_CW_WIN_GRAVITY
+                                  | XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP,
+                                  (const uint32_t [])
+                                  {
+                                      globalconf.screen->black_pixel,
+                                      XCB_GRAVITY_NORTH_WEST,
+                                      XCB_GRAVITY_NORTH_WEST,
+                                      1,
+                                      FRAME_SELECT_INPUT_EVENT_MASK,
+                                      globalconf.default_cmap
+                                  });
+                xcb_reparent_window(globalconf.connection, c->window, c->frame_window, real_geometry.x, real_geometry.y);
+                xcb_map_window(globalconf.connection, c->frame_window);
+                stack_windows();
+            } else {
+                assert(c->frame_window != XCB_NONE);
+
+                xcb_reparent_window(globalconf.connection, c->window, globalconf.screen->root, geometry.x, geometry.y);
+                xcb_destroy_window(globalconf.connection, c->frame_window);
+                c->frame_window = XCB_NONE;
+            }
+            if (globalconf.focus.client == c) {
+                xcb_window_t win = globalconf.focus.window_no_focus;
+                if (client_on_selected_tags(c)) {
+                    if(!c->nofocus)
+                        win = c->window;
+                    else
+                        win = client_get_nofocus_window(c);
+                }
+                xcb_set_input_focus(globalconf.connection, XCB_INPUT_FOCUS_PARENT,
+                                    win, globalconf.timestamp);
+            }
+            xcb_change_window_attributes(globalconf.connection,
+                                         globalconf.screen->root,
+                                         XCB_CW_EVENT_MASK,
+                                         ROOT_WINDOW_EVENT_MASK);
+            xcb_change_window_attributes(globalconf.connection, c->window, XCB_CW_EVENT_MASK, (uint32_t[]) { CLIENT_SELECT_INPUT_EVENT_MASK });
+            xutil_ungrab_server(globalconf.connection);
+        }
+
+
         /* Is there anything to do? */
         if (AREA_EQUAL(geometry, c->x11_frame_geometry)
                 && AREA_EQUAL(real_geometry, c->x11_client_geometry)) {
@@ -1742,12 +1803,18 @@ client_geometry_refresh(void)
             ignored_enterleave = true;
         }
 
-        xcb_configure_window(globalconf.connection, c->frame_window,
-                XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
-                (uint32_t[]) { geometry.x, geometry.y, geometry.width, geometry.height });
-        xcb_configure_window(globalconf.connection, c->window,
-                XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
-                (uint32_t[]) { real_geometry.x, real_geometry.y, real_geometry.width, real_geometry.height });
+        if (c->frame_window != XCB_NONE) {
+            xcb_configure_window(globalconf.connection, c->frame_window,
+                    XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+                    (uint32_t[]) { geometry.x, geometry.y, geometry.width, geometry.height });
+            xcb_configure_window(globalconf.connection, c->window,
+                    XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+                    (uint32_t[]) { real_geometry.x, real_geometry.y, real_geometry.width, real_geometry.height });
+        } else {
+            xcb_configure_window(globalconf.connection, c->window,
+                    XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+                    (uint32_t[]) { real_geometry.x, real_geometry.y, real_geometry.width, real_geometry.height });
+        }
 
         c->x11_frame_geometry = geometry;
         c->x11_client_geometry = real_geometry;
@@ -3230,6 +3297,8 @@ client_refresh_titlebar_partial(client_t *c, client_titlebar_t bar, int16_t x, i
     if(c->titlebar[bar].drawable == NULL
             || c->titlebar[bar].drawable->pixmap == XCB_NONE
             || !c->titlebar[bar].drawable->refreshed)
+        return;
+    if(c->frame_window == XCB_NONE)
         return;
 
     /* Is the titlebar part of the area that should get redrawn? */
